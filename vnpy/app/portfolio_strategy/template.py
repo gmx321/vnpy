@@ -34,14 +34,16 @@ class StrategyTemplate(ABC):
         self.inited: bool = False
         self.trading: bool = False
         self.pos: Dict[str, int] = defaultdict(int)
+
         self.orders: Dict[str, OrderData] = {}
         self.active_orderids: Set[str] = set()
 
         # Copy a new variables list here to avoid duplicate insert when multiple
         # strategy instances are created with the same strategy class.
-        self.variables: Dict = copy(self.variables)
+        self.variables: List = copy(self.variables)
         self.variables.insert(0, "inited")
         self.variables.insert(1, "trading")
+        self.variables.insert(2, "pos")
 
         self.update_setting(setting)
 
@@ -145,34 +147,32 @@ class StrategyTemplate(ABC):
         """
         self.orders[order.vt_orderid] = order
 
-        if order.is_active():
-            self.active_orderids.add(order.vt_orderid)
-        elif order.vt_orderid in self.active_orderids:
+        if not order.is_active() and order.vt_orderid in self.active_orderids:
             self.active_orderids.remove(order.vt_orderid)
 
-    def buy(self, vt_symbol: str, price: float, volume: float, lock: bool = False) -> List[str]:
+    def buy(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> List[str]:
         """
         Send buy order to open a long position.
         """
-        return self.send_order(vt_symbol, Direction.LONG, Offset.OPEN, price, volume, lock)
+        return self.send_order(vt_symbol, Direction.LONG, Offset.OPEN, price, volume, lock, net)
 
-    def sell(self, vt_symbol: str, price: float, volume: float, lock: bool = False) -> List[str]:
+    def sell(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> List[str]:
         """
         Send sell order to close a long position.
         """
-        return self.send_order(vt_symbol, Direction.SHORT, Offset.CLOSE, price, volume, lock)
+        return self.send_order(vt_symbol, Direction.SHORT, Offset.CLOSE, price, volume, lock, net)
 
-    def short(self, vt_symbol: str, price: float, volume: float, lock: bool = False) -> List[str]:
+    def short(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> List[str]:
         """
         Send short order to open as short position.
         """
-        return self.send_order(vt_symbol, Direction.SHORT, Offset.OPEN, price, volume, lock)
+        return self.send_order(vt_symbol, Direction.SHORT, Offset.OPEN, price, volume, lock, net)
 
-    def cover(self, vt_symbol: str, price: float, volume: float, lock: bool = False) -> List[str]:
+    def cover(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> List[str]:
         """
         Send cover order to close a short position.
         """
-        return self.send_order(vt_symbol, Direction.LONG, Offset.CLOSE, price, volume, lock)
+        return self.send_order(vt_symbol, Direction.LONG, Offset.CLOSE, price, volume, lock, net)
 
     def send_order(
         self,
@@ -181,15 +181,20 @@ class StrategyTemplate(ABC):
         offset: Offset,
         price: float,
         volume: float,
-        lock: bool = False
+        lock: bool = False,
+        net: bool = False,
     ) -> List[str]:
         """
         Send a new order.
         """
         if self.trading:
             vt_orderids = self.strategy_engine.send_order(
-                self, vt_symbol, direction, offset, price, volume, lock
+                self, vt_symbol, direction, offset, price, volume, lock, net
             )
+
+            for vt_orderid in vt_orderids:
+                self.active_orderids.add(vt_orderid)
+
             return vt_orderids
         else:
             return []
@@ -218,7 +223,7 @@ class StrategyTemplate(ABC):
 
     def get_all_active_orderids(self) -> List[OrderData]:
         """"""
-        return list(self.active_orderids.values())
+        return list(self.active_orderids)
 
     def write_log(self, msg: str) -> None:
         """
@@ -245,3 +250,10 @@ class StrategyTemplate(ABC):
         """
         if self.inited:
             self.strategy_engine.send_email(msg, self)
+
+    def sync_data(self):
+        """
+        Sync strategy variables value into disk storage.
+        """
+        if self.trading:
+            self.strategy_engine.sync_strategy_data(self)

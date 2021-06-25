@@ -10,6 +10,9 @@ from copy import copy
 from datetime import datetime, timedelta
 from enum import Enum
 from threading import Lock
+import pytz
+
+from requests.exceptions import SSLError
 
 from vnpy.api.rest import RestClient, Request
 from vnpy.api.websocket import WebsocketClient
@@ -73,6 +76,8 @@ TIMEDELTA_MAP = {
     Interval.HOUR: timedelta(hours=1),
     Interval.DAILY: timedelta(days=1),
 }
+
+CHINA_TZ = pytz.timezone("Asia/Shanghai")
 
 
 class Security(Enum):
@@ -222,7 +227,8 @@ class BinanceRestApi(RestClient):
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "X-MBX-APIKEY": self.key
+            "X-MBX-APIKEY": self.key,
+            "Connection": "close"
         }
 
         if security in [Security.SIGNED, Security.API_KEY]:
@@ -247,7 +253,7 @@ class BinanceRestApi(RestClient):
         self.proxy_host = proxy_host
 
         self.connect_time = (
-            int(datetime.now().strftime("%y%m%d%H%M%S")) * self.order_count
+            int(datetime.now(CHINA_TZ).strftime("%y%m%d%H%M%S")) * self.order_count
         )
 
         self.init(REST_HOST, proxy_host, proxy_port)
@@ -317,7 +323,7 @@ class BinanceRestApi(RestClient):
 
     def send_order(self, req: OrderRequest):
         """"""
-        orderid = str(self.connect_time + self._new_order_id())
+        orderid = "NKD8FYX4-" + str(self.connect_time + self._new_order_id())
         order = req.create_order_data(
             orderid,
             self.gateway_name
@@ -329,8 +335,7 @@ class BinanceRestApi(RestClient):
         }
 
         params = {
-            "symbol": req.symbol,
-            "timeInForce": "GTC",
+            "symbol": req.symbol.upper(),
             "side": DIRECTION_VT2BINANCE[req.direction],
             "type": ORDERTYPE_VT2BINANCE[req.type],
             "price": str(req.price),
@@ -338,6 +343,9 @@ class BinanceRestApi(RestClient):
             "newClientOrderId": orderid,
             "newOrderRespType": "ACK"
         }
+
+        if req.type == OrderType.LIMIT:
+            params["timeInForce"] = "GTC"
 
         self.add_request(
             method="POST",
@@ -359,7 +367,7 @@ class BinanceRestApi(RestClient):
         }
 
         params = {
-            "symbol": req.symbol,
+            "symbol": req.symbol.upper(),
             "origClientOrderId": req.orderid
         }
 
@@ -432,12 +440,9 @@ class BinanceRestApi(RestClient):
     def on_query_order(self, data, request):
         """"""
         for d in data:
-            dt = datetime.fromtimestamp(d["time"] / 1000)
-            time = dt.strftime("%Y-%m-%d %H:%M:%S")
-
             order = OrderData(
                 orderid=d["clientOrderId"],
-                symbol=d["symbol"],
+                symbol=d["symbol"].lower(),
                 exchange=Exchange.BINANCE,
                 price=float(d["price"]),
                 volume=float(d["origQty"]),
@@ -445,7 +450,7 @@ class BinanceRestApi(RestClient):
                 direction=DIRECTION_BINANCE2VT[d["side"]],
                 traded=float(d["executedQty"]),
                 status=STATUS_BINANCE2VT.get(d["status"], None),
-                time=time,
+                datetime=generate_datetime(d["time"]),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_order(order)
@@ -469,7 +474,7 @@ class BinanceRestApi(RestClient):
                     min_volume = float(f["stepSize"])
 
             contract = ContractData(
-                symbol=d["symbol"],
+                symbol=d["symbol"].lower(),
                 exchange=Exchange.BINANCE,
                 name=name,
                 pricetick=pricetick,
@@ -511,7 +516,7 @@ class BinanceRestApi(RestClient):
         self.gateway.on_order(order)
 
         # Record exception if not ConnectionError
-        if not issubclass(exception_type, ConnectionError):
+        if not issubclass(exception_type, (ConnectionError, SSLError)):
             self.on_error(exception_type, exception_value, tb, request)
 
     def on_cancel_order(self, data, request):
@@ -539,7 +544,7 @@ class BinanceRestApi(RestClient):
         while True:
             # Create query params
             params = {
-                "symbol": req.symbol,
+                "symbol": req.symbol.upper(),
                 "interval": INTERVAL_VT2BINANCE[req.interval],
                 "limit": limit,
                 "startTime": start_time * 1000,         # convert to millisecond
@@ -573,12 +578,10 @@ class BinanceRestApi(RestClient):
                 buf = []
 
                 for l in data:
-                    dt = datetime.fromtimestamp(l[0] / 1000)    # convert to second
-
                     bar = BarData(
                         symbol=req.symbol,
                         exchange=req.exchange,
-                        datetime=dt,
+                        datetime=generate_datetime(l[0]),
                         interval=req.interval,
                         volume=float(l[5]),
                         open_price=float(l[1]),
@@ -628,7 +631,7 @@ class BinanceTradeWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict):  # type: (dict)->None
         """"""
-        if packet["e"] == "outboundAccountInfo":
+        if packet["e"] == "outboundAccountPosition":
             self.on_account(packet)
         elif packet["e"] == "executionReport":
             self.on_order(packet)
@@ -648,16 +651,13 @@ class BinanceTradeWebsocketApi(WebsocketClient):
 
     def on_order(self, packet: dict):
         """"""
-        dt = datetime.fromtimestamp(packet["O"] / 1000)
-        time = dt.strftime("%Y-%m-%d %H:%M:%S")
-
         if packet["C"] == "":
             orderid = packet["c"]
         else:
             orderid = packet["C"]
 
         order = OrderData(
-            symbol=packet["s"],
+            symbol=packet["s"].lower(),
             exchange=Exchange.BINANCE,
             orderid=orderid,
             type=ORDERTYPE_BINANCE2VT[packet["o"]],
@@ -666,7 +666,7 @@ class BinanceTradeWebsocketApi(WebsocketClient):
             volume=float(packet["q"]),
             traded=float(packet["z"]),
             status=STATUS_BINANCE2VT[packet["X"]],
-            time=time,
+            datetime=generate_datetime(packet["O"]),
             gateway_name=self.gateway_name
         )
 
@@ -677,9 +677,6 @@ class BinanceTradeWebsocketApi(WebsocketClient):
         if not trade_volume:
             return
 
-        trade_dt = datetime.fromtimestamp(packet["T"] / 1000)
-        trade_time = trade_dt.strftime("%Y-%m-%d %H:%M:%S")
-
         trade = TradeData(
             symbol=order.symbol,
             exchange=order.exchange,
@@ -688,7 +685,7 @@ class BinanceTradeWebsocketApi(WebsocketClient):
             direction=order.direction,
             price=float(packet["L"]),
             volume=trade_volume,
-            time=trade_time,
+            datetime=generate_datetime(packet["T"]),
             gateway_name=self.gateway_name,
         )
         self.gateway.on_trade(trade)
@@ -726,10 +723,10 @@ class BinanceDataWebsocketApi(WebsocketClient):
             symbol=req.symbol,
             name=symbol_name_map.get(req.symbol, ""),
             exchange=Exchange.BINANCE,
-            datetime=datetime.now(),
+            datetime=datetime.now(CHINA_TZ),
             gateway_name=self.gateway_name,
         )
-        self.ticks[req.symbol.lower()] = tick
+        self.ticks[req.symbol] = tick
 
         # Close previous connection
         if self._active:
@@ -760,7 +757,7 @@ class BinanceDataWebsocketApi(WebsocketClient):
             tick.high_price = float(data['h'])
             tick.low_price = float(data['l'])
             tick.last_price = float(data['c'])
-            tick.datetime = datetime.fromtimestamp(float(data['E']) / 1000)
+            tick.datetime = generate_datetime(float(data['E']))
         else:
             bids = data["bids"]
             for n in range(5):
@@ -776,3 +773,10 @@ class BinanceDataWebsocketApi(WebsocketClient):
 
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
+
+
+def generate_datetime(timestamp: float) -> datetime:
+    """"""
+    dt = datetime.fromtimestamp(timestamp / 1000)
+    dt = CHINA_TZ.localize(dt)
+    return dt

@@ -5,26 +5,26 @@ SPY-USD-STK   SMART
 EUR-USD-CASH  IDEALPRO
 XAUUSD-USD-CMDTY  SMART
 ES-202002-USD-FUT  GLOBEX
+SI-202006-1000-USD-FUT  NYMEX
+ES-2020006-C-2430-50-USD-FOP  GLOBEX
 """
 
 
 from copy import copy
 from datetime import datetime
-from queue import Empty
 from threading import Thread, Condition
 from typing import Optional
 import shelve
+from tzlocal import get_localzone
 
-from ibapi import comm
 from ibapi.client import EClient
-from ibapi.common import MAX_MSG_LEN, NO_VALID_ID, OrderId, TickAttrib, TickerId
+from ibapi.common import OrderId, TickAttrib, TickerId
 from ibapi.contract import Contract, ContractDetails
 from ibapi.execution import Execution
 from ibapi.order import Order
 from ibapi.order_state import OrderState
 from ibapi.ticktype import TickType, TickTypeEnum
 from ibapi.wrapper import EWrapper
-from ibapi.errors import BAD_LENGTH
 from ibapi.common import BarData as IbBarData
 
 from vnpy.trader.gateway import BaseGateway
@@ -52,10 +52,12 @@ from vnpy.trader.constant import (
     Interval
 )
 from vnpy.trader.utility import get_file_path
+from vnpy.trader.event import EVENT_TIMER
+from vnpy.event import Event
 
 
 ORDERTYPE_VT2IB = {
-    OrderType.LIMIT: "LMT", 
+    OrderType.LIMIT: "LMT",
     OrderType.MARKET: "MKT",
     OrderType.STOP: "STP"
 }
@@ -77,7 +79,15 @@ EXCHANGE_VT2IB = {
     Exchange.HKFE: "HKFE",
     Exchange.CFE: "CFE",
     Exchange.NYSE: "NYSE",
-    Exchange.NASDAQ: "NASDAQ"
+    Exchange.NASDAQ: "NASDAQ",
+    Exchange.ARCA: "ARCA",
+    Exchange.EDGEA: "EDGEA",
+    Exchange.ISLAND: "ISLAND",
+    Exchange.BATS: "BATS",
+    Exchange.IEX: "IEX",
+    Exchange.IBKRATS: "IBKRATS",
+    Exchange.OTC: "PINK",
+    Exchange.SGX: "SGX"
 }
 EXCHANGE_IB2VT = {v: k for k, v in EXCHANGE_VT2IB.items()}
 
@@ -98,7 +108,8 @@ PRODUCT_IB2VT = {
     "CMDTY": Product.SPOT,
     "FUT": Product.FUTURES,
     "OPT": Product.OPTION,
-    "FOT": Product.OPTION
+    "FOT": Product.OPTION,
+    "CONTFUT": Product.FUTURES
 }
 
 OPTION_VT2IB = {OptionType.CALL: "CALL", OptionType.PUT: "PUT"}
@@ -157,6 +168,7 @@ class IbGateway(BaseGateway):
         super().__init__(event_engine, "IB")
 
         self.api = IbApi(self)
+        self.count = 0
 
     def connect(self, setting: dict):
         """
@@ -168,6 +180,8 @@ class IbGateway(BaseGateway):
         account = setting["交易账户"]
 
         self.api.connect(host, port, clientid, account)
+
+        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
     def close(self):
         """
@@ -209,11 +223,22 @@ class IbGateway(BaseGateway):
         """"""
         return self.api.query_history(req)
 
+    def process_timer_event(self, event: Event):
+        """"""
+        self.count += 1
+        if self.count < 10:
+            return
+        self.count = 0
+
+        self.api.check_connection()
+
 
 class IbApi(EWrapper):
     """"""
     data_filename = "ib_contract_data.db"
     data_filepath = str(get_file_path(data_filename))
+
+    local_tz = get_localzone()
 
     def __init__(self, gateway: BaseGateway):
         """"""
@@ -227,6 +252,7 @@ class IbApi(EWrapper):
         self.reqid = 0
         self.orderid = 0
         self.clientid = 0
+        self.history_reqid = 0
         self.account = ""
         self.ticks = {}
         self.orders = {}
@@ -234,13 +260,14 @@ class IbApi(EWrapper):
         self.contracts = {}
 
         self.tick_exchange = {}
+        self.subscribed = {}
+        self.data_ready = False
 
         self.history_req = None
         self.history_condition = Condition()
         self.history_buf = []
 
-        self.client = IbClient(self)
-        self.thread = Thread(target=self.client.run)
+        self.client = EClient(self)
 
     def connectAck(self):  # pylint: disable=invalid-name
         """
@@ -250,6 +277,8 @@ class IbApi(EWrapper):
         self.gateway.write_log("IB TWS连接成功")
 
         self.load_contract_data()
+
+        self.data_ready = False
 
     def connectionClosed(self):  # pylint: disable=invalid-name
         """
@@ -279,16 +308,29 @@ class IbApi(EWrapper):
         msg = f"服务器时间: {time_string}"
         self.gateway.write_log(msg)
 
-    def error(
-        self, reqId: TickerId, errorCode: int, errorString: str
-    ):  # pylint: disable=invalid-name
+    def error(self, reqId: TickerId, errorCode: int, errorString: str):  # pylint: disable=invalid-name
         """
         Callback of error caused by specific request.
         """
         super().error(reqId, errorCode, errorString)
+        if reqId == self.history_reqid:
+            self.history_condition.acquire()
+            self.history_condition.notify()
+            self.history_condition.release()
 
         msg = f"信息通知，代码：{errorCode}，内容: {errorString}"
         self.gateway.write_log(msg)
+
+        # Market data server is connected
+        if errorCode == 2104 and not self.data_ready:
+            self.data_ready = True
+
+            self.client.reqCurrentTime()
+
+            reqs = list(self.subscribed.values())
+            self.subscribed.clear()
+            for req in reqs:
+                self.subscribe(req)
 
     def tickPrice(  # pylint: disable=invalid-name
         self, reqId: TickerId, tickType: TickType, price: float, attrib: TickAttrib
@@ -310,12 +352,14 @@ class IbApi(EWrapper):
         if contract:
             tick.name = contract.name
 
-        # Forex and spot product of IDEALPRO has no tick time and last price.
+        # Forex of IDEALPRO and Spot Commodity has no tick time and last price.
         # We need to calculate locally.
         exchange = self.tick_exchange[reqId]
-        if exchange is Exchange.IDEALPRO:
+        if exchange is Exchange.IDEALPRO or "CMDTY" in tick.symbol:
+            if not tick.bid_price_1 or not tick.ask_price_1:
+                return
             tick.last_price = (tick.bid_price_1 + tick.ask_price_1) / 2
-            tick.datetime = datetime.now()
+            tick.datetime = datetime.now(self.local_tz)
         self.gateway.on_tick(copy(tick))
 
     def tickSize(
@@ -347,7 +391,8 @@ class IbApi(EWrapper):
             return
 
         tick = self.ticks[reqId]
-        tick.datetime = datetime.fromtimestamp(int(value))
+        dt = datetime.fromtimestamp(int(value))
+        tick.datetime = self.local_tz.localize(dt)
 
         self.gateway.on_tick(copy(tick))
 
@@ -384,6 +429,9 @@ class IbApi(EWrapper):
 
         orderid = str(orderId)
         order = self.orders.get(orderid, None)
+        if not order:
+            return
+
         order.traded = filled
 
         # To filter PendingCancel status
@@ -409,9 +457,9 @@ class IbApi(EWrapper):
 
         orderid = str(orderId)
         order = OrderData(
-            symbol=ib_contract.conId,
+            symbol=generate_symbol(ib_contract),
             exchange=EXCHANGE_IB2VT.get(
-                ib_contract.exchange, ib_contract.exchange),
+                ib_contract.exchange, Exchange.SMART),
             type=ORDERTYPE_IB2VT[ib_order.orderType],
             orderid=orderid,
             direction=DIRECTION_IB2VT[ib_order.action],
@@ -481,7 +529,7 @@ class IbApi(EWrapper):
             exchange = Exchange.SMART   # Use smart routing for default
 
         if not exchange:
-            msg = f"存在不支持的交易所持仓{contract.conId} {contract.exchange} {contract.primaryExchange}"
+            msg = f"存在不支持的交易所持仓{generate_symbol(contract)} {contract.exchange} {contract.primaryExchange}"
             self.gateway.write_log(msg)
             return
 
@@ -529,7 +577,7 @@ class IbApi(EWrapper):
             exchange=EXCHANGE_IB2VT[ib_contract.exchange],
             name=contractDetails.longName,
             product=PRODUCT_IB2VT[ib_contract.secType],
-            size=ib_contract.multiplier,
+            size=int(ib_contract.multiplier),
             pricetick=contractDetails.minTick,
             net_position=True,
             history_data=True,
@@ -551,16 +599,18 @@ class IbApi(EWrapper):
         """
         super().execDetails(reqId, contract, execution)
 
-        # today_date = datetime.now().strftime("%Y%m%d")
+        dt = datetime.strptime(execution.time, "%Y%m%d  %H:%M:%S")
+        dt = self.local_tz.localize(dt)
+
         trade = TradeData(
-            symbol=contract.conId,
-            exchange=EXCHANGE_IB2VT.get(contract.exchange, contract.exchange),
+            symbol=generate_symbol(contract),
+            exchange=EXCHANGE_IB2VT.get(contract.exchange, Exchange.SMART),
             orderid=str(execution.orderId),
             tradeid=str(execution.execId),
             direction=DIRECTION_IB2VT[execution.side],
             price=execution.price,
             volume=execution.shares,
-            time=datetime.strptime(execution.time, "%Y%m%d  %H:%M:%S"),
+            datetime=dt,
             gateway_name=self.gateway_name,
         )
 
@@ -583,7 +633,12 @@ class IbApi(EWrapper):
         """
         Callback of history data update.
         """
-        dt = datetime.strptime(ib_bar.date, "%Y%m%d %H:%M:%S")
+        # When requesting daily and weekly history data, the date format is "%Y%m%d"
+        if len(ib_bar.date) > 8:
+            dt = datetime.strptime(ib_bar.date, "%Y%m%d %H:%M:%S")
+        else:
+            dt = datetime.strptime(ib_bar.date, "%Y%m%d")
+        dt = self.local_tz.localize(dt)
 
         bar = BarData(
             symbol=self.history_req.symbol,
@@ -615,12 +670,27 @@ class IbApi(EWrapper):
         if self.status:
             return
 
+        self.host = host
+        self.port = port
         self.clientid = clientid
         self.account = account
+
         self.client.connect(host, port, clientid)
+        self.thread = Thread(target=self.client.run)
         self.thread.start()
 
-        self.client.reqCurrentTime()
+    def check_connection(self):
+        """"""
+        if self.client.isConnected():
+            return
+
+        if self.status:
+            self.close()
+
+        self.client.connect(self.host, self.port, self.clientid)
+
+        self.thread = Thread(target=self.client.run)
+        self.thread.start()
 
     def close(self):
         """
@@ -643,6 +713,11 @@ class IbApi(EWrapper):
             self.gateway.write_log(f"不支持的交易所{req.exchange}")
             return
 
+        # Filter duplicate subscribe
+        if req.vt_symbol in self.subscribed:
+            return
+        self.subscribed[req.vt_symbol] = req
+
         # Extract ib contract detail
         ib_contract = generate_ib_contract(req.symbol, req.exchange)
         if not ib_contract:
@@ -660,7 +735,7 @@ class IbApi(EWrapper):
         tick = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
-            datetime=datetime.now(),
+            datetime=datetime.now(self.local_tz),
             gateway_name=self.gateway_name,
         )
         self.ticks[self.reqid] = tick
@@ -728,7 +803,7 @@ class IbApi(EWrapper):
             end = req.end
             end_str = end.strftime("%Y%m%d %H:%M:%S")
         else:
-            end = datetime.now()
+            end = datetime.now(self.local_tz)
             end_str = ""
 
         delta = end - req.start
@@ -741,6 +816,7 @@ class IbApi(EWrapper):
         else:
             bar_type = "TRADES"
 
+        self.history_reqid = self.reqid
         self.client.reqHistoricalData(
             self.reqid,
             ib_contract,
@@ -748,7 +824,7 @@ class IbApi(EWrapper):
             duration,
             bar_size,
             bar_type,
-            1,
+            0,
             1,
             False,
             []
@@ -782,33 +858,6 @@ class IbApi(EWrapper):
         f.close()
 
 
-class IbClient(EClient):
-    """"""
-
-    def run(self):
-        """
-        Reimplement the original run message loop of eclient.
-
-        Remove all unnecessary try...catch... and allow exceptions to interrupt loop.
-        """
-        while not self.done and self.isConnected():
-            try:
-                text = self.msg_queue.get(block=True, timeout=0.2)
-
-                if len(text) > MAX_MSG_LEN:
-                    errorMsg = "%s:%d:%s" % (BAD_LENGTH.msg(), len(text), text)
-                    self.wrapper.error(
-                        NO_VALID_ID, BAD_LENGTH.code(), errorMsg
-                    )
-                    self.disconnect()
-                    break
-
-                fields = comm.read_fields(text)
-                self.decoder.interpret(fields)
-            except Empty:
-                pass
-
-
 def generate_ib_contract(symbol: str, exchange: Exchange) -> Optional[Contract]:
     """"""
     try:
@@ -822,6 +871,10 @@ def generate_ib_contract(symbol: str, exchange: Exchange) -> Optional[Contract]:
 
         if ib_contract.secType in ["FUT", "OPT", "FOP"]:
             ib_contract.lastTradeDateOrContractMonth = fields[1]
+
+        if ib_contract.secType == "FUT":
+            if len(fields) == 5:
+                ib_contract.multiplier = int(fields[2])
 
         if ib_contract.secType in ["OPT", "FOP"]:
             ib_contract.right = fields[2]

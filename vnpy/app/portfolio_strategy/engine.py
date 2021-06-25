@@ -1,13 +1,14 @@
 """"""
 
 import importlib
-import os
+import glob
 import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Type, Any, Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from tzlocal import get_localzone
 
 from vnpy.event import Event, EventEngine
 from vnpy.trader.engine import BaseEngine, MainEngine
@@ -37,9 +38,9 @@ from vnpy.trader.constant import (
     Offset
 )
 from vnpy.trader.utility import load_json, save_json, extract_vt_symbol, round_to
-from vnpy.trader.database import database_manager
 from vnpy.trader.rqdata import rqdata_client
 from vnpy.trader.converter import OffsetConverter
+from vnpy.trader.database import database_manager
 
 from .base import (
     APP_NAME,
@@ -173,7 +174,8 @@ class StrategyEngine(BaseEngine):
         offset: Offset,
         price: float,
         volume: float,
-        lock: bool
+        lock: bool,
+        net: bool,
     ):
         """
         Send a new order to server.
@@ -196,10 +198,11 @@ class StrategyEngine(BaseEngine):
             type=OrderType.LIMIT,
             price=price,
             volume=volume,
+            reference=f"{APP_NAME}_{strategy.strategy_name}"
         )
 
         # Convert with offset converter
-        req_list = self.offset_converter.convert_order_request(original_req, lock)
+        req_list = self.offset_converter.convert_order_request(original_req, lock, net)
 
         # Send Orders
         vt_orderids = []
@@ -252,23 +255,37 @@ class StrategyEngine(BaseEngine):
         dts = list(dts)
         dts.sort()
 
-        for dt in dts:
-            bars = {}
+        bars = {}
 
+        for dt in dts:
             for vt_symbol in vt_symbols:
                 bar = history_data.get((dt, vt_symbol), None)
+
+                # If bar data of vt_symbol at dt exists
                 if bar:
                     bars[vt_symbol] = bar
-                else:
-                    dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-                    self.write_log(f"数据缺失：{dt_str} {vt_symbol}", strategy)
+                # Otherwise, use previous data to backfill
+                elif vt_symbol in bars:
+                    old_bar = bars[vt_symbol]
+
+                    bar = BarData(
+                        symbol=old_bar.symbol,
+                        exchange=old_bar.exchange,
+                        datetime=dt,
+                        open_price=old_bar.close_price,
+                        high_price=old_bar.close_price,
+                        low_price=old_bar.close_price,
+                        close_price=old_bar.close_price,
+                        gateway_name=old_bar.gateway_name
+                    )
+                    bars[vt_symbol] = bar
 
             self.call_strategy_func(strategy, strategy.on_bars, bars)
 
     def load_bar(self, vt_symbol: str, days: int, interval: Interval) -> List[BarData]:
         """"""
         symbol, exchange = extract_vt_symbol(vt_symbol)
-        end = datetime.now()
+        end = datetime.now(get_localzone())
         start = end - timedelta(days)
         contract: ContractData = self.main_engine.get_contract(vt_symbol)
         data = []
@@ -317,7 +334,7 @@ class StrategyEngine(BaseEngine):
             self.write_log(msg, strategy)
 
     def add_strategy(
-        self, class_name: str, strategy_name: str, vt_symbols: str, setting: dict
+        self, class_name: str, strategy_name: str, vt_symbols: list, setting: dict
     ):
         """
         Add a new strategy.
@@ -368,7 +385,10 @@ class StrategyEngine(BaseEngine):
         if data:
             for name in strategy.variables:
                 value = data.get(name, None)
-                if value:
+                if name == "pos":
+                    pos = getattr(strategy, name)
+                    pos.update(value)
+                elif value:
                     setattr(strategy, name, value)
 
         # Subscribe market data
@@ -476,17 +496,11 @@ class StrategyEngine(BaseEngine):
         """
         Load strategy class from certain folder.
         """
-        for dirpath, dirnames, filenames in os.walk(str(path)):
-            for filename in filenames:
-                if filename.endswith(".py"):
-                    strategy_module_name = ".".join(
-                        [module_name, filename.replace(".py", "")])
-                elif filename.endswith(".pyd"):
-                    strategy_module_name = ".".join(
-                        [module_name, filename.split(".")[0]])
-                else:
-                    continue
-
+        for suffix in ["py", "pyd"]:
+            pathname = f"{path}/*.{suffix}"
+            for filepath in glob.glob(pathname):
+                stem = Path(filepath).stem
+                strategy_module_name = f"{module_name}.{stem}"
                 self.load_strategy_class_from_module(strategy_module_name)
 
     def load_strategy_class_from_module(self, module_name: str):
@@ -603,12 +617,12 @@ class StrategyEngine(BaseEngine):
 
     def write_log(self, msg: str, strategy: StrategyTemplate = None):
         """
-        Create cta engine log event.
+        Create portfolio engine log event.
         """
         if strategy:
             msg = f"{strategy.strategy_name}: {msg}"
 
-        log = LogData(msg=msg, gateway_name="CtaStrategy")
+        log = LogData(msg=msg, gateway_name=APP_NAME)
         event = Event(type=EVENT_PORTFOLIO_LOG, data=log)
         self.event_engine.put(event)
 
